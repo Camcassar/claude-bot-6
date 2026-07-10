@@ -1,5 +1,23 @@
 # HANDOFF — Day Trader Bot (ORB + VWAP, Bybit) + trader.dev scouting
 
+## VWAP BAND STRATEGY BUILT (2026-07-10, single file)
+
+New standalone strategy `vwap_strategy.py` (repo ROOT, deliberately ONE
+self-contained file: theory + indicators + signal + backtester + sweeps +
+walk-forward + live bot + optional dashboard DB writer). Authored by Opus by
+pulling the reusable pieces out of the ORB bot's VWAP work (session-anchored
+VWAP, right-side-of-VWAP bias, volume confirmation, ATR filter, risk sizing,
+breakeven, flat-at-close). Hypothesis: intraday mean-reversion around session
+VWAP measured in volume-weighted sigma bands; two modes (`revert` default,
+`reclaim` momentum). Self-tested on SYNTHETIC data only (cloud env had no
+Bybit egress) — `python vwap_strategy.py selftest` = ALL PASSED. Real
+validation pending on the Mac: `backtest` / `sweep` / `walkforward`
+subcommands auto-fetch ETH/SOL/etc from Bybit public API. Wires into the
+localhost:8080 command centre via `--db <path>` (schema matches src/bot/db.py).
+Caught+fixed a real blow-up bug (gap-onto-stop -> ~0 stop distance -> giant
+size -> -95R) with a min_stop_pct floor; guard lives in both the live and
+backtest signal paths.
+
 ## VELOCITY-Z V3 BUILT (2026-06-12, Claude Code session)
 
 Re-reverse-engineered v2 and found a **critical bug: v2 never passed its
