@@ -124,6 +124,13 @@ class Bybit:
             reduceOnly=True,
         )
 
+    def get_daily_funding(self):
+        """Sum of the last 3 funding rates (= last 24h on 8h funding)."""
+        r = self.http.get_funding_rate_history(
+            category=config.CATEGORY, symbol=self.symbol, limit=3
+        )
+        return sum(float(row["fundingRate"]) for row in r["result"]["list"])
+
     def get_closed_pnl(self, limit=10):
         """Recent closed-trade PnL for this symbol (circuit breaker tracking)."""
         r = self.http.get_closed_pnl(

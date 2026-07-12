@@ -35,6 +35,8 @@ SMA_LEN     = int(os.getenv("SMA_LEN", "150"))    # regime filter
 RSI_LEN     = 2
 ATR_LEN     = 14
 
+FUNDING_TH  = float(os.getenv("FUNDING_TH", "0.0008"))  # skip entry when 24h funding sum exceeds this (crowded longs)
+
 SIZING_MODE = os.getenv("SIZING_MODE", "full")    # "full" = equity x leverage; "risk" = RISK_PCT via stop distance
 RISK_PCT    = float(os.getenv("RISK_PCT", "4.0"))
 NOTIONAL_HEADROOM = 0.95                          # keep fee/margin headroom in full mode
@@ -284,6 +286,21 @@ class CumRsi2Bot:
 
         if not state["entry"]:
             log.info("no entry | cum=%.1f regime_up=%s", state["cum_rsi"], state["regime_up"])
+            return
+
+        try:
+            funding = self.ex.get_daily_funding()
+        except Exception as e:
+            log.warning("funding fetch failed (%s) — allowing entry", e)
+            funding = 0.0
+        if funding > FUNDING_TH:
+            log.info("entry BLOCKED by funding filter | 24h funding %.4f%% > %.4f%%",
+                     funding * 100, FUNDING_TH * 100)
+            tg(
+                f"🚫 *{BOT_NAME}* — dip signal skipped\n"
+                f"24h funding `{funding * 100:.3f}%` > `{FUNDING_TH * 100:.2f}%` (crowded longs)\n"
+                f"Cum RSI(2) `{state['cum_rsi']:.1f}` — waiting for a cleaner dip"
+            )
             return
 
         equity = self.ex.get_equity()
