@@ -238,6 +238,9 @@ class CumRsi2Bot:
                 pos_for_status = None
             self._send_status(pos_for_status)
 
+        # near-real-time win/loss alerts (bracket fills happen intra-day)
+        self._track_results()
+
         candles = self.ex.get_candles(limit=CANDLES_NEEDED + 5)
         if len(candles) < CANDLES_NEEDED + 1:
             log.warning("not enough candles yet (%d)", len(candles))
@@ -248,7 +251,6 @@ class CumRsi2Bot:
         if bar_ts == self.last_bar:
             return
         self.last_bar = bar_ts
-        self._track_results()
 
         state = compute_state(closed)
         self._last_state = state
@@ -264,6 +266,12 @@ class CumRsi2Bot:
             if state["exit"]:
                 log.info("EXIT signal | rsi=%.1f > %.0f — closing position", state["rsi"], EXIT_RSI)
                 self.ex.close_position(pos["side"], pos["size"])
+                tg(
+                    f"🔁 *{BOT_NAME}* — EXIT SIGNAL, SELL PLACED\n"
+                    f"Closing `{pos['size']}` {SYMBOL} @ ~`{state['close']:.2f}`\n"
+                    f"RSI(2) `{state['rsi']:.1f}` > {EXIT_RSI:.0f} — snap-back complete\n"
+                    f"P&L confirmation follows once the fill settles"
+                )
             return
 
         if self.had_position:
