@@ -126,6 +126,27 @@ class CumRsi2Bot:
         self.last_pnl_ts = int(time.time() * 1000)
         self.last_report_hour = -1
         self._last_state = None
+        self._last_regime = None  # True=up, False=down, None=unknown
+
+    def _check_regime_flip(self, state):
+        if state is None:
+            return
+        regime = state["regime_up"]
+        if self._last_regime is not None and regime != self._last_regime:
+            if regime:
+                tg(
+                    f"🟢 *{BOT_NAME}* — REGIME FLIPPED UP\n"
+                    f"Close `{state['close']:.2f}` > SMA{SMA_LEN} `{state['sma']:.2f}`\n"
+                    f"Dip-buying is now ARMED — entry fires when cum RSI(2) < {CUM_TH:.0f}\n"
+                    f"Cum RSI(2) now: `{state['cum_rsi']:.1f}`"
+                )
+            else:
+                tg(
+                    f"🔴 *{BOT_NAME}* — REGIME FLIPPED DOWN\n"
+                    f"Close `{state['close']:.2f}` < SMA{SMA_LEN} `{state['sma']:.2f}`\n"
+                    f"Standing aside — no new entries until regime is UP again"
+                )
+        self._last_regime = regime
 
     def _track_results(self):
         try:
@@ -160,6 +181,7 @@ class CumRsi2Bot:
             state = compute_state(candles[:-1])
             if state:
                 self._last_state = state
+                self._check_regime_flip(state)
         except Exception:
             pass
         state = self._last_state
