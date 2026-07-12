@@ -1,11 +1,14 @@
 """
-Momentum-Z | ETHUSDT 1H — Cam's live Bybit bot.
+CumRSI2-Regime | ETHUSDT 1D — Cam's live Bybit bot.
 
-Signal: EMA-8 velocity z-score |z|>=2.5 + 200h trend alignment filter.
-Exit:   TP +6.5% / SL -3.0% server-side brackets (crash-safe).
-Risk:   4% equity per trade. Circuit breaker: 4 losses -> 3-day pause.
+Signal: Cumulative RSI(2) two-day sum < 55 while close > SMA-150 (uptrend regime).
+Exit:   RSI(2) > 70 signal close at daily bar close, or server-side SL at 4.5x ATR(14).
+        A wide 8x ATR TP rides as a crash-safe ceiling bracket.
+Risk:   Full-equity sizing at 3x leverage (SIZING_MODE=risk switches to 4%-risk sizing).
 
-Backtest (Jan 2024 – Jun 2026): +364% net, PF 1.92, DD 13.3%, Sharpe 2.62.
+Backtest (Jan 2022 - Jul 2026, Bybit ETHUSDT.P 1d, unlevered):
+  +114.5% net, PF 2.90, WR 71.1%, DD -16.4%, 45 trades.
+  Walk-forward: H1 +17.7% / H2 +82.2%. Wiggle-test stable (+/-20% params all positive).
 """
 
 import csv
@@ -13,36 +16,41 @@ import logging
 import os
 import sys
 import time
-from math import floor, sqrt
+from math import floor
 
 import requests
 
 import config
 from exchange import Bybit
-from indicators import ema as ema_series
+from indicators import atr_series, rsi_series, sma_series
 
-SYMBOL      = os.getenv("SYMBOL", "ETHUSDT")
-BOT_NAME    = f"Momentum-Z | {SYMBOL} 1H"
-EMA_N       = 8
-VEL_LAG     = 3
-Z_WIN       = 144
-Z_THR       = 2.5
-TREND_BARS  = 200
-TP_PCT      = 0.065
-SL_PCT      = 0.030
-RISK_PCT    = 4.0
-POLL_SECONDS = 60
-CANDLES_NEEDED = TREND_BARS + Z_WIN + VEL_LAG + 10
+SYMBOL   = os.getenv("SYMBOL", "ETHUSDT")
+BOT_NAME = f"CumRSI2-Regime | {SYMBOL} 1D"
+
+CUM_TH      = float(os.getenv("CUM_TH", "55"))    # cum RSI(2) two-day entry threshold
+EXIT_RSI    = float(os.getenv("EXIT_RSI", "70"))  # RSI(2) exit threshold
+STOP_ATR    = float(os.getenv("STOP_ATR", "4.5")) # SL distance in ATR(14)
+TP_ATR      = float(os.getenv("TP_ATR", "8.0"))   # safety ceiling bracket, rarely hit
+SMA_LEN     = int(os.getenv("SMA_LEN", "150"))    # regime filter
+RSI_LEN     = 2
+ATR_LEN     = 14
+
+SIZING_MODE = os.getenv("SIZING_MODE", "full")    # "full" = equity x leverage; "risk" = RISK_PCT via stop distance
+RISK_PCT    = float(os.getenv("RISK_PCT", "4.0"))
+NOTIONAL_HEADROOM = 0.95                          # keep fee/margin headroom in full mode
+
+POLL_SECONDS   = 60
+CANDLES_NEEDED = SMA_LEN + ATR_LEN + 20
 TRADE_LOG = os.getenv("TRADE_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "trades.csv"))
-CB_LOSSES   = 4
-CB_PAUSE_BARS = 72
+CB_LOSSES     = 4
+CB_PAUSE_BARS = 7   # daily bars
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [Momentum-Z]: %(message)s",
+    format="%(asctime)s %(levelname)s [CumRSI2]: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("momentum_z")
+log = logging.getLogger("cumrsi2")
 
 # ── Telegram ──────────────────────────────────────────────────────────
 _TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -64,12 +72,13 @@ def tg(msg: str) -> None:
 
 
 # ── Trade log ─────────────────────────────────────────────────────────
-_LOG_FIELDS = ["timestamp", "type", "direction", "qty", "price", "tp", "sl", "equity", "z_score", "pnl", "loss_streak"]
+_LOG_FIELDS = ["timestamp", "type", "direction", "qty", "price", "tp", "sl", "equity", "cum_rsi", "pnl", "loss_streak"]
 
 
 def _log_trade(row: dict) -> None:
     write_header = not os.path.exists(TRADE_LOG)
     try:
+        os.makedirs(os.path.dirname(TRADE_LOG), exist_ok=True)
         with open(TRADE_LOG, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=_LOG_FIELDS)
             if write_header:
@@ -80,41 +89,34 @@ def _log_trade(row: dict) -> None:
 
 
 # ── Signal ────────────────────────────────────────────────────────────
-def compute_signal(candles):
-    """Returns (z_score, side) where side is +1, -1, or 0."""
+def compute_state(candles):
+    """Returns dict with rsi, cum_rsi, sma, atr, regime_up, entry, exit for the latest closed bar."""
     closes = [c["close"] for c in candles]
     if len(closes) < CANDLES_NEEDED:
-        return 0.0, 0
+        return None
 
-    base = ema_series(closes, EMA_N)
-    vel = [
-        (base[i] - base[i - VEL_LAG]) / base[i - VEL_LAG]
-        for i in range(VEL_LAG, len(base))
-    ]
-    if len(vel) < Z_WIN:
-        return 0.0, 0
+    rsi = rsi_series(closes, RSI_LEN)
+    sma = sma_series(closes, SMA_LEN)
+    atr = atr_series(candles, ATR_LEN)
+    if len(rsi) < 2 or not sma or not atr:
+        return None
 
-    window = vel[-Z_WIN:]
-    m = sum(window) / Z_WIN
-    var = sum((v - m) ** 2 for v in window) / Z_WIN
-    z = (vel[-1] - m) / sqrt(var) if var > 0 else 0.0
-
-    side = 1 if z >= Z_THR else (-1 if z <= -Z_THR else 0)
-    trend = closes[-1] - closes[-1 - TREND_BARS]
-    trend_aligned = (side == 0) or ((side == 1) == (trend > 0))
-
-    if side != 0 and not trend_aligned:
-        log.info("z=%.2f blocked by trend filter", z)
-        return z, 0
-
-    if side != 0:
-        log.info("SIGNAL %s | z=%.2f", "LONG" if side == 1 else "SHORT", z)
-
-    return z, side
+    cum = rsi[-1] + rsi[-2]
+    regime_up = closes[-1] > sma[-1]
+    return {
+        "close":     closes[-1],
+        "rsi":       rsi[-1],
+        "cum_rsi":   cum,
+        "sma":       sma[-1],
+        "atr":       atr[-1],
+        "regime_up": regime_up,
+        "entry":     cum < CUM_TH and regime_up,
+        "exit":      rsi[-1] > EXIT_RSI,
+    }
 
 
 # ── Bot ───────────────────────────────────────────────────────────────
-class MomentumZBot:
+class CumRsi2Bot:
     def __init__(self):
         self.ex = Bybit(symbol=SYMBOL)
         self.last_bar = 0
@@ -123,8 +125,7 @@ class MomentumZBot:
         self.had_position = False
         self.last_pnl_ts = int(time.time() * 1000)
         self.last_report_hour = -1
-        self._last_z = 0.0
-        self._last_trend = None  # True=up, False=down, None=unknown
+        self._last_state = None
 
     def _track_results(self):
         try:
@@ -137,8 +138,8 @@ class MomentumZBot:
                         log.info("loss booked %.2f USDT | streak=%d", pnl, self.loss_streak)
                         tg(f"❌ *{BOT_NAME}*\nTrade closed: `{pnl:+.2f} USDT`\nLoss streak: {self.loss_streak}")
                         if self.loss_streak >= CB_LOSSES:
-                            self.pause_until_bar = self.last_bar + CB_PAUSE_BARS * 3_600_000
-                            msg = f"⚠️ *{BOT_NAME}* — CIRCUIT BREAKER\n{CB_LOSSES} straight losses. Pausing 3 days."
+                            self.pause_until_bar = self.last_bar + CB_PAUSE_BARS * 86_400_000
+                            msg = f"⚠️ *{BOT_NAME}* — CIRCUIT BREAKER\n{CB_LOSSES} straight losses. Pausing {CB_PAUSE_BARS} days."
                             log.warning(msg)
                             tg(msg)
                     else:
@@ -154,32 +155,30 @@ class MomentumZBot:
             log.warning("pnl tracking failed: %s", e)
 
     def _send_status(self, pos):
-        closes_needed = CANDLES_NEEDED
         try:
-            candles = self.ex.get_candles(limit=closes_needed + 5)
-            closed = candles[:-1]
-            z, _ = compute_signal(closed)
-            closes = [c["close"] for c in closed]
-            trend_up = closes[-1] > closes[-1 - TREND_BARS] if len(closes) > TREND_BARS else None
-            self._last_z = z
-            self._last_trend = trend_up
+            candles = self.ex.get_candles(limit=CANDLES_NEEDED + 5)
+            state = compute_state(candles[:-1])
+            if state:
+                self._last_state = state
         except Exception:
-            z = self._last_z
-            trend_up = self._last_trend
+            pass
+        state = self._last_state
 
-        trend_str = ("UP ✅" if trend_up else "DOWN ✅") if trend_up is not None else "unknown"
-        z_str = f"`{z:+.3f}`"
-        pct_to_thr = abs(z) / Z_THR * 100
+        if state:
+            regime_str = "UP ✅" if state["regime_up"] else "DOWN ⛔"
+            cum_str = f"`{state['cum_rsi']:.1f}` (entry < {CUM_TH:.0f})"
+        else:
+            regime_str = "unknown"
+            cum_str = "unavailable"
 
         if pos:
-            side_str = "📈 LONG" if pos.get("side") == "Buy" else "📉 SHORT"
-            status_str = f"{side_str} position held — TP/SL active"
+            status_str = f"📈 LONG position held — SL bracket active, exit on RSI(2) > {EXIT_RSI:.0f}"
         elif self.last_bar < self.pause_until_bar:
             status_str = "⚠️ Circuit breaker active — paused"
-        elif abs(z) >= Z_THR and trend_up is not None and ((z > 0) == trend_up):
-            status_str = "🔥 Signal firing!"
+        elif state and state["entry"]:
+            status_str = "🔥 Signal firing — will enter on next daily close!"
         else:
-            status_str = f"Watching — z is {pct_to_thr:.0f}% of threshold"
+            status_str = "Watching — waiting for oversold dip in uptrend"
 
         try:
             equity = self.ex.get_equity()
@@ -190,12 +189,22 @@ class MomentumZBot:
         msg = (
             f"📊 *{BOT_NAME}*\n"
             f"Balance: {equity_str}\n"
-            f"z-score: {z_str} | Threshold: ±{Z_THR}\n"
-            f"Trend (200h): {trend_str}\n"
+            f"Cum RSI(2): {cum_str}\n"
+            f"Regime (SMA{SMA_LEN}): {regime_str}\n"
             f"{status_str}"
         )
-        log.info("hourly status | z=%.3f trend=%s pos=%s", z, trend_up, bool(pos))
+        log.info("hourly status | pos=%s", bool(pos))
         tg(msg)
+
+    def _position_qty(self, equity, px, atr):
+        qty_step, min_qty = self.ex.get_instrument_limits()
+        if SIZING_MODE == "risk":
+            stop_dist = STOP_ATR * atr
+            qty = (RISK_PCT / 100 * equity) / stop_dist
+        else:
+            qty = (equity * config.LEVERAGE * NOTIONAL_HEADROOM) / px
+        qty = floor(round(qty / qty_step, 9)) * qty_step
+        return qty, min_qty
 
     def tick(self):
         now_hour = int(time.time()) // 3600
@@ -207,7 +216,7 @@ class MomentumZBot:
                 pos_for_status = None
             self._send_status(pos_for_status)
 
-        candles = self.ex.get_candles(limit=400)
+        candles = self.ex.get_candles(limit=CANDLES_NEEDED + 5)
         if len(candles) < CANDLES_NEEDED + 1:
             log.warning("not enough candles yet (%d)", len(candles))
             return
@@ -219,72 +228,76 @@ class MomentumZBot:
         self.last_bar = bar_ts
         self._track_results()
 
+        state = compute_state(closed)
+        self._last_state = state
+        if state is None:
+            log.warning("indicator warmup incomplete")
+            return
+
         pos = self.ex.get_position()
+
+        # exit first: RSI(2) snap-back close at daily bar close
         if pos:
             self.had_position = True
+            if state["exit"]:
+                log.info("EXIT signal | rsi=%.1f > %.0f — closing position", state["rsi"], EXIT_RSI)
+                self.ex.close_position(pos["side"], pos["size"])
             return
 
         if self.had_position:
-            log.info("position closed by bracket")
+            log.info("position closed (bracket or signal)")
             self.had_position = False
 
         if bar_ts < self.pause_until_bar:
             log.info("circuit breaker active — skipping")
             return
 
-        z, side = compute_signal(closed)
-        self._last_z = z
-        if side == 0:
+        if not state["entry"]:
+            log.info("no entry | cum=%.1f regime_up=%s", state["cum_rsi"], state["regime_up"])
             return
 
         equity = self.ex.get_equity()
-        px = closed[-1]["close"]
-        qty_step, min_qty = self.ex.get_instrument_limits()
-        qty = (RISK_PCT / 100 * equity) / (SL_PCT * px)
-        qty = floor(round(qty / qty_step, 9)) * qty_step
-
+        px = state["close"]
+        qty, min_qty = self._position_qty(equity, px, state["atr"])
         if qty < min_qty:
             log.warning("qty %.4f below minimum, skipping", qty)
             return
 
-        direction = "LONG" if side == 1 else "SHORT"
-        tp = px * (1 + side * TP_PCT)
-        sl = px * (1 - side * SL_PCT)
+        sl = px - STOP_ATR * state["atr"]
+        tp = px + TP_ATR * state["atr"]
 
-        log.info("ENTER %s %.4f @ ~%.2f | TP %.2f SL %.2f | equity %.2f",
-                 direction, qty, px, tp, sl, equity)
+        log.info("ENTER LONG %.4f @ ~%.2f | TP %.2f SL %.2f | equity %.2f | cum=%.1f",
+                 qty, px, tp, sl, equity, state["cum_rsi"])
 
-        self.ex.market_order("Buy" if side == 1 else "Sell", qty,
-                             stop_loss=sl, take_profit=tp)
+        self.ex.market_order("Buy", qty, stop_loss=sl, take_profit=tp)
         self.had_position = True
 
         ts_now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        log.info("TRADE ENTERED %s %.4f @ %.2f | z=%.3f | TP %.2f SL %.2f | equity %.2f",
-                 direction, qty, px, z, tp, sl, equity)
         tg(
-            f"{'📈' if side == 1 else '📉'} *{BOT_NAME}* — TRADE ENTERED\n"
-            f"*{direction}* `{qty}` {SYMBOL}\n"
+            f"📈 *{BOT_NAME}* — TRADE ENTERED\n"
+            f"*LONG* `{qty}` {SYMBOL}\n"
             f"Entry: `{px:.2f}` | TP: `{tp:.2f}` | SL: `{sl:.2f}`\n"
-            f"z-score: `{z:+.3f}` | Risk: `{RISK_PCT:.0f}%` of `{equity:.2f} USDT`"
+            f"Cum RSI(2): `{state['cum_rsi']:.1f}` | Sizing: `{SIZING_MODE}` @ `{config.LEVERAGE}x` of `{equity:.2f} USDT`"
         )
         _log_trade({
             "timestamp": ts_now,
             "type": "ENTRY",
-            "direction": direction,
+            "direction": "LONG",
             "qty": qty,
             "price": px,
             "tp": round(tp, 4),
             "sl": round(sl, 4),
             "equity": round(equity, 2),
-            "z_score": round(z, 4),
+            "cum_rsi": round(state["cum_rsi"], 2),
         })
 
     def run(self):
         startup = (
             f"🚀 *{BOT_NAME}* — LIVE\n"
-            f"Symbol: {SYMBOL} | TF: 1H\n"
-            f"TP: {TP_PCT*100:.1f}% | SL: {SL_PCT*100:.1f}% | Trend: {TREND_BARS}h\n"
-            f"Testnet: {config.TESTNET}"
+            f"Symbol: {SYMBOL} | TF: 1D\n"
+            f"Entry: cum RSI(2) < {CUM_TH:.0f} + close > SMA{SMA_LEN}\n"
+            f"Exit: RSI(2) > {EXIT_RSI:.0f} | SL: {STOP_ATR:.1f}x ATR{ATR_LEN}\n"
+            f"Sizing: {SIZING_MODE} @ {config.LEVERAGE}x | Testnet: {config.TESTNET}"
         )
         log.info(startup.replace("*", "").replace("`", ""))
         tg(startup)
@@ -304,4 +317,4 @@ class MomentumZBot:
 if __name__ == "__main__":
     if not config.API_KEY or not config.API_SECRET:
         sys.exit("Set BYBIT_API_KEY and BYBIT_API_SECRET in .env first.")
-    MomentumZBot().run()
+    CumRsi2Bot().run()

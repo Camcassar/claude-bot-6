@@ -1,5 +1,5 @@
 """
-Velocity-Z v2 — configuration.
+CumRSI2-Regime — configuration.
 Secrets come from Railway environment variables (never bake keys into code).
 """
 
@@ -17,9 +17,9 @@ TESTNET    = os.getenv("TESTNET", "true").lower() == "true"
 # ── Market ────────────────────────────────────────────────────────────
 SYMBOL      = os.getenv("SYMBOL", "ETHUSDT")  # Bybit USDT linear perpetual
 CATEGORY    = "linear"
-TIMEFRAME   = "60"    # 1h bars (Bybit kline interval)
-CANDLE_LIMIT = 400    # default fetch size; velocity_bot overrides to 400
+TIMEFRAME   = os.getenv("TIMEFRAME", "D")  # daily bars (Bybit kline interval)
+CANDLE_LIMIT = 400    # default fetch size; velocity_bot overrides as needed
 POLL_SECONDS = 60     # main loop interval
 
 # ── Risk ──────────────────────────────────────────────────────────────
-LEVERAGE = 3          # account leverage cap (risk-based sizing keeps actual exposure low)
+LEVERAGE = int(os.getenv("LEVERAGE", "3"))  # applied at execution; backtest is unlevered
